@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aus/proxyplease"
 )
 
 // This map is used to store URLs string as the key with a reference count as
@@ -261,6 +263,18 @@ func natsDialTimeout(network, address string, timeout time.Duration) (net.Conn, 
 		KeepAlive: -1,
 	}
 	return d.Dial(network, address)
+}
+
+func natsProxyDialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	proxyplease.SetDebugf(func(format string, a ...interface{}) {
+		fmt.Printf(format+"\n", a...)
+	})
+
+	dcontext := proxyplease.NewDialContext(proxyplease.Proxy{})
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return dcontext(ctx, network, address)
 }
 
 // redactURLList() returns a copy of a list of URL pointers where each item
