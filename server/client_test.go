@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,8 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,14 +27,12 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"crypto/rand"
-	"crypto/tls"
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
@@ -253,7 +253,7 @@ func TestClientNoResponderSupport(t *testing.T) {
 	if len(am) == 0 {
 		t.Fatalf("Did not get a match for %q", l)
 	}
-	checkPayload(cr, []byte("NATS/1.0 503\r\n\r\n"), t)
+	checkPayload(cr, []byte("NATS/1.0 503\r\nNats-Subject: foo\r\n\r\n\r\n"), t)
 }
 
 func TestServerHeaderSupport(t *testing.T) {
@@ -1484,7 +1484,11 @@ func TestWildcardCharsInLiteralSubjectWorks(t *testing.T) {
 	}
 }
 
-func TestDynamicBuffers(t *testing.T) {
+// This test ensures that coalescing into the fixed-size output
+// queues works as expected. When bytes are queued up, they should
+// not overflow a buffer until the capacity is exceeded, at which
+// point a new buffer should be added.
+func TestClientOutboundQueueCoalesce(t *testing.T) {
 	opts := DefaultOptions()
 	s := RunServer(opts)
 	defer s.Shutdown()
@@ -1495,139 +1499,49 @@ func TestDynamicBuffers(t *testing.T) {
 	}
 	defer nc.Close()
 
-	// Grab the client from server.
-	s.mu.Lock()
-	lc := len(s.clients)
-	c := s.clients[s.gcid]
-	s.mu.Unlock()
-
-	if lc != 1 {
-		t.Fatalf("Expected only 1 client but got %d\n", lc)
+	clients := s.GlobalAccount().getClients()
+	if len(clients) != 1 {
+		t.Fatal("Expecting a client to exist")
 	}
-	if c == nil {
-		t.Fatal("Expected to retrieve client\n")
-	}
+	client := clients[0]
+	client.mu.Lock()
+	defer client.mu.Unlock()
 
-	// Create some helper functions and data structures.
-	done := make(chan bool)            // Used to stop recording.
-	type maxv struct{ rsz, wsz int32 } // Used to hold max values.
-	results := make(chan maxv)
+	// First up, queue something small into the queue.
+	client.queueOutbound([]byte{1, 2, 3, 4, 5})
 
-	// stopRecording stops the recording ticker and releases go routine.
-	stopRecording := func() maxv {
-		done <- true
-		return <-results
+	if len(client.out.nb) != 1 {
+		t.Fatal("Expecting a single queued buffer")
 	}
-	// max just grabs max values.
-	max := func(a, b int32) int32 {
-		if a > b {
-			return a
-		}
-		return b
-	}
-	// Returns current value of the buffer sizes.
-	getBufferSizes := func() (int32, int32) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.in.rsz, c.out.sz
-	}
-	// Record the max values seen.
-	recordMaxBufferSizes := func() {
-		ticker := time.NewTicker(10 * time.Microsecond)
-		defer ticker.Stop()
-
-		var m maxv
-
-		recordMax := func() {
-			rsz, wsz := getBufferSizes()
-			m.rsz = max(m.rsz, rsz)
-			m.wsz = max(m.wsz, wsz)
-		}
-
-		for {
-			select {
-			case <-done:
-				recordMax()
-				results <- m
-				return
-			case <-ticker.C:
-				recordMax()
-			}
-		}
-	}
-	// Check that the current value is what we expected.
-	checkBuffers := func(ers, ews int32) {
-		t.Helper()
-		rsz, wsz := getBufferSizes()
-		if rsz != ers {
-			t.Fatalf("Expected read buffer of %d, but got %d\n", ers, rsz)
-		}
-		if wsz != ews {
-			t.Fatalf("Expected write buffer of %d, but got %d\n", ews, wsz)
-		}
+	if l := len(client.out.nb[0]); l != 5 {
+		t.Fatalf("Expecting only 5 bytes in the first queued buffer, found %d instead", l)
 	}
 
-	// Check that the max was as expected.
-	checkResults := func(m maxv, rsz, wsz int32) {
-		t.Helper()
-		if rsz != m.rsz {
-			t.Fatalf("Expected read buffer of %d, but got %d\n", rsz, m.rsz)
-		}
-		if wsz != m.wsz {
-			t.Fatalf("Expected write buffer of %d, but got %d\n", wsz, m.wsz)
-		}
+	// Then queue up a few more bytes, but not enough
+	// to overflow into the next buffer.
+	client.queueOutbound([]byte{6, 7, 8, 9, 10})
+
+	if len(client.out.nb) != 1 {
+		t.Fatal("Expecting a single queued buffer")
+	}
+	if l := len(client.out.nb[0]); l != 10 {
+		t.Fatalf("Expecting 10 bytes in the first queued buffer, found %d instead", l)
 	}
 
-	// Here is where testing begins..
-
-	// Should be at or below the startBufSize for both.
-	rsz, wsz := getBufferSizes()
-	if rsz > startBufSize {
-		t.Fatalf("Expected read buffer of <= %d, but got %d\n", startBufSize, rsz)
+	// Finally, queue up something that is guaranteed
+	// to overflow.
+	b := nbPoolSmall.Get().(*[nbPoolSizeSmall]byte)[:]
+	b = b[:cap(b)]
+	client.queueOutbound(b)
+	if len(client.out.nb) != 2 {
+		t.Fatal("Expecting buffer to have overflowed")
 	}
-	if wsz > startBufSize {
-		t.Fatalf("Expected write buffer of <= %d, but got %d\n", startBufSize, wsz)
+	if l := len(client.out.nb[0]); l != cap(b) {
+		t.Fatalf("Expecting %d bytes in the first queued buffer, found %d instead", cap(b), l)
 	}
-
-	// Send some data.
-	data := make([]byte, 2048)
-	rand.Read(data)
-
-	go recordMaxBufferSizes()
-	for i := 0; i < 200; i++ {
-		nc.Publish("foo", data)
+	if l := len(client.out.nb[1]); l != 10 {
+		t.Fatalf("Expecting 10 bytes in the second queued buffer, found %d instead", l)
 	}
-	nc.Flush()
-	m := stopRecording()
-
-	if m.rsz != maxBufSize && m.rsz != maxBufSize/2 {
-		t.Fatalf("Expected read buffer of %d or %d, but got %d\n", maxBufSize, maxBufSize/2, m.rsz)
-	}
-	if m.wsz > startBufSize {
-		t.Fatalf("Expected write buffer of <= %d, but got %d\n", startBufSize, m.wsz)
-	}
-
-	// Create Subscription to test outbound buffer from server.
-	nc.Subscribe("foo", func(m *nats.Msg) {
-		// Just eat it..
-	})
-	go recordMaxBufferSizes()
-
-	for i := 0; i < 200; i++ {
-		nc.Publish("foo", data)
-	}
-	nc.Flush()
-
-	m = stopRecording()
-	checkResults(m, maxBufSize, maxBufSize)
-
-	// Now test that we shrink correctly.
-
-	// Should go to minimum for both..
-	for i := 0; i < 20; i++ {
-		nc.Flush()
-	}
-	checkBuffers(minBufSize, minBufSize)
 }
 
 func TestClientTraceRace(t *testing.T) {
@@ -1712,6 +1626,18 @@ func TestClientUserInfo(t *testing.T) {
 	if got != expected {
 		t.Errorf("Expected %q, got %q", expected, got)
 	}
+
+	c = &client{
+		cid: 1024,
+		opts: ClientOpts{
+			Token: "s3cr3t!",
+		},
+	}
+	got = c.getAuthUser()
+	expected = `Token "[REDACTED]"`
+	if got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
 }
 
 type captureWarnLogger struct {
@@ -1719,7 +1645,7 @@ type captureWarnLogger struct {
 	warn chan string
 }
 
-func (l *captureWarnLogger) Warnf(format string, v ...interface{}) {
+func (l *captureWarnLogger) Warnf(format string, v ...any) {
 	select {
 	case l.warn <- fmt.Sprintf(format, v...):
 	default:
@@ -1773,6 +1699,7 @@ func TestReadloopWarning(t *testing.T) {
 
 func TestTraceMsg(t *testing.T) {
 	c := &client{}
+
 	// Enable message trace
 	c.trace = true
 
@@ -1785,25 +1712,25 @@ func TestTraceMsg(t *testing.T) {
 		{
 			Desc:            "normal length",
 			Msg:             []byte(fmt.Sprintf("normal%s", CR_LF)),
-			Wanted:          " - <<- MSG_PAYLOAD: [\"normal\"]",
+			Wanted:          "<<- MSG_PAYLOAD: [\"normal\"]",
 			MaxTracedMsgLen: 10,
 		},
 		{
 			Desc:            "over length",
 			Msg:             []byte(fmt.Sprintf("over length%s", CR_LF)),
-			Wanted:          " - <<- MSG_PAYLOAD: [\"over lengt...\"]",
+			Wanted:          "<<- MSG_PAYLOAD: [\"over lengt...\"]",
 			MaxTracedMsgLen: 10,
 		},
 		{
 			Desc:            "unlimited length",
 			Msg:             []byte(fmt.Sprintf("unlimited length%s", CR_LF)),
-			Wanted:          " - <<- MSG_PAYLOAD: [\"unlimited length\"]",
+			Wanted:          "<<- MSG_PAYLOAD: [\"unlimited length\"]",
 			MaxTracedMsgLen: 0,
 		},
 		{
 			Desc:            "negative max traced msg len",
 			Msg:             []byte(fmt.Sprintf("negative max traced msg len%s", CR_LF)),
-			Wanted:          " - <<- MSG_PAYLOAD: [\"negative max traced msg len\"]",
+			Wanted:          "<<- MSG_PAYLOAD: [\"negative max traced msg len\"]",
 			MaxTracedMsgLen: -1,
 		},
 	}
@@ -1820,6 +1747,229 @@ func TestTraceMsg(t *testing.T) {
 		if !reflect.DeepEqual(ut.Wanted, got) {
 			t.Errorf("Desc: %s. Msg %q. Traced msg want: %s, got: %s", ut.Desc, ut.Msg, ut.Wanted, got)
 		}
+	}
+}
+
+func TestTraceMsgHeadersOnly(t *testing.T) {
+	c := &client{}
+	// Enable message trace
+	c.trace = true
+
+	hdr := fmt.Sprintf(`NATS/1.0%sFoo: 1%s%s`, CR_LF, CR_LF, CR_LF)
+	hdr2 := fmt.Sprintf(`NATS/1.0%sFoo: 1%sBar: 2%s%s`, CR_LF, CR_LF, CR_LF, CR_LF)
+
+	cases := []struct {
+		Desc            string
+		Msg             []byte
+		Hdr             int
+		Wanted          string
+		MaxTracedMsgLen int
+	}{
+		{
+			Desc:            "payload only",
+			Msg:             []byte(`test\r\n`),
+			Hdr:             0,
+			Wanted:          _EMPTY_,
+			MaxTracedMsgLen: 0,
+		},
+		{
+			Desc:            "header only",
+			Msg:             []byte(hdr),
+			Hdr:             len(hdr),
+			Wanted:          `<<- MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1"]`,
+			MaxTracedMsgLen: 0,
+		},
+		{
+			Desc:            "with header and payload",
+			Msg:             []byte(fmt.Sprintf("%stest%s", hdr, CR_LF)),
+			Hdr:             len(hdr),
+			Wanted:          `<<- MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1"]`,
+			MaxTracedMsgLen: 0,
+		},
+		{
+			Desc:            "max length",
+			Msg:             []byte(hdr),
+			Hdr:             len(hdr),
+			Wanted:          `<<- MSG_PAYLOAD: ["NATS/1..."]`,
+			MaxTracedMsgLen: 6,
+		},
+		{
+			Desc:            "two headers max length",
+			Msg:             []byte(hdr2),
+			Hdr:             len(hdr2),
+			Wanted:          `<<- MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1\r\nBar..."]`,
+			MaxTracedMsgLen: 21,
+		},
+	}
+
+	for _, ut := range cases {
+		t.Run(ut.Desc, func(t *testing.T) {
+			c.srv = &Server{
+				opts: &Options{MaxTracedMsgLen: ut.MaxTracedMsgLen, TraceHeaders: true},
+			}
+			c.srv.SetLogger(&DummyLogger{}, true, true)
+			c.pa.hdr = ut.Hdr
+
+			c.traceMsg(ut.Msg)
+
+			got := c.srv.logging.logger.(*DummyLogger).Msg
+			require_Equal(t, string(ut.Wanted), got)
+		})
+	}
+}
+
+func TestTraceMsgDelivery(t *testing.T) {
+	logger := &DummyLogger{}
+
+	opts := DefaultOptions()
+	opts.Trace = true
+	s := RunServer(opts)
+	s.SetLogger(logger, true, true)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	ncp, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer ncp.Close()
+
+	_, err = nc.Subscribe("foo", func(msg *nats.Msg) {
+		m := nats.NewMsg(msg.Reply)
+		m.Header["A"] = []string{"1"}
+		m.Header["B"] = []string{"2"}
+		m.Data = []byte("Hi Traced")
+		msg.RespondMsg(m)
+	})
+	require_NoError(t, err)
+	nc.Flush()
+
+	msg := nats.NewMsg("foo")
+	msg.Header = nats.Header{}
+	msg.Header["A"] = []string{"A:1"}
+	msg.Header["B"] = []string{"B:2"}
+	msg.Data = []byte("Hello Traced")
+	_, err = ncp.RequestMsg(msg, 100*time.Millisecond)
+	require_NoError(t, err)
+
+	// Wait for logging to settle and safely read the message.
+	time.Sleep(50 * time.Millisecond)
+	logger.Lock()
+	m := logger.Msg
+	logger.Unlock()
+	require_Contains(t, m, "->> MSG_PAYLOAD:")
+	require_Contains(t, m, "NATS/1.0")
+	require_Contains(t, m, "Hi Traced")
+
+	_, err = nc.Subscribe("bar", func(msg *nats.Msg) {
+		m := nats.NewMsg(msg.Reply)
+		m.Data = []byte("Plain Response")
+		msg.RespondMsg(m)
+	})
+	require_NoError(t, err)
+	nc.Flush()
+
+	msg = nats.NewMsg("bar")
+	_, err = ncp.RequestMsg(msg, 100*time.Millisecond)
+	require_NoError(t, err)
+
+	// Wait and safely read again.
+	time.Sleep(50 * time.Millisecond)
+	logger.Lock()
+	m = logger.Msg
+	logger.Unlock()
+	require_Contains(t, m, "->> MSG_PAYLOAD:")
+	require_Contains(t, m, "Plain Response")
+}
+
+func TestTraceMsgDeliveryWithHeaders(t *testing.T) {
+	c := &client{}
+	c.trace = true
+	hdr := fmt.Sprintf(`NATS/1.0%sFoo: 1%s%s`, CR_LF, CR_LF, CR_LF)
+	hdr2 := fmt.Sprintf(`NATS/1.0%sFoo: bar%sBar: baz%s%s`, CR_LF, CR_LF, CR_LF, CR_LF)
+
+	cases := []struct {
+		name         string
+		msg          []byte
+		hdr          int
+		traceDeliver bool
+		traceHeaders bool
+		expected     string
+	}{
+		{
+			name:         "delivery with headers enabled",
+			msg:          []byte(hdr),
+			hdr:          len(hdr),
+			traceHeaders: true,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1"]`,
+		},
+		{
+			name:         "delivery with full message",
+			msg:          []byte(fmt.Sprintf("%stest%s", hdr, CR_LF)),
+			hdr:          len(hdr),
+			traceHeaders: false,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1\r\n\r\ntest"]`,
+		},
+		{
+			name:         "delivery with headers only",
+			msg:          []byte(fmt.Sprintf("%stest%s", hdr, CR_LF)),
+			hdr:          len(hdr),
+			traceHeaders: true,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1"]`,
+		},
+		{
+			name:         "delivery multiple headers",
+			msg:          []byte(hdr2),
+			hdr:          len(hdr2),
+			traceHeaders: true,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: bar\r\nBar: baz"]`,
+		},
+		{
+			name:         "delivery with payload but headers only tracing",
+			msg:          []byte(fmt.Sprintf("%spayload data%s", hdr2, CR_LF)),
+			hdr:          len(hdr2),
+			traceHeaders: true,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: bar\r\nBar: baz"]`,
+		},
+		{
+			name:         "delivery no headers but tracing enabled",
+			msg:          []byte(fmt.Sprintf("plain message%s", CR_LF)),
+			hdr:          0,
+			traceHeaders: false,
+			expected:     `->> MSG_PAYLOAD: ["plain message"]`,
+		},
+		{
+			name:         "delivery headers disabled but deliver enabled",
+			msg:          []byte(fmt.Sprintf("%spayload%s", hdr, CR_LF)),
+			hdr:          len(hdr),
+			traceHeaders: false,
+			expected:     `->> MSG_PAYLOAD: ["NATS/1.0\r\nFoo: 1\r\n\r\npayload"]`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := &DummyLogger{}
+
+			c.srv = &Server{
+				opts: &Options{
+					Trace:        true,
+					TraceHeaders: tc.traceHeaders,
+				},
+			}
+			c.srv.SetLogger(logger, true, true)
+			c.pa.hdr = tc.hdr
+			c.traceMsgDelivery(tc.msg, tc.hdr)
+			got := logger.Msg
+			if tc.expected == "" {
+				// Disabled
+				require_Equal(t, tc.expected, got)
+			} else {
+				require_True(t, strings.Contains(got, "->> MSG_PAYLOAD:"))
+				require_Equal(t, tc.expected, got)
+			}
+		})
 	}
 }
 
@@ -1963,11 +2113,9 @@ func TestPingNotSentTooSoon(t *testing.T) {
 	if c.sendRTTPing() {
 		t.Fatalf("RTT ping should not have been sent")
 	}
-	// Speed up detection of time elapsed by moving the c.start to more than
-	// 2 secs in the past.
-	c.mu.Lock()
-	c.start = time.Unix(0, c.start.UnixNano()-int64(maxNoRTTPingBeforeFirstPong+time.Second))
-	c.mu.Unlock()
+	// Used to move c.start here but it is often causing race conditions,
+	// so we'll just wait instead.
+	time.Sleep(maxNoRTTPingBeforeFirstPong)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -2114,8 +2262,18 @@ func TestClientSlowConsumerWithoutConnect(t *testing.T) {
 		if n := atomic.LoadInt64(&s.slowConsumers); n != 1 {
 			return fmt.Errorf("Expected 1 slow consumer, got: %v", n)
 		}
+		if n := s.scStats.clients.Load(); n != 1 {
+			return fmt.Errorf("Expected 1 slow consumer, got: %v", n)
+		}
 		return nil
 	})
+	varz, err := s.Varz(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if varz.SlowConsumersStats.Clients != 1 {
+		t.Error("Expected a slow consumer client in varz")
+	}
 }
 
 func TestClientNoSlowConsumerIfConnectExpected(t *testing.T) {
@@ -2136,32 +2294,6 @@ func TestClientNoSlowConsumerIfConnectExpected(t *testing.T) {
 	}
 	if n := atomic.LoadInt64(&s.slowConsumers); n != 0 {
 		t.Fatalf("Expected 0 slow consumer, got: %v", n)
-	}
-}
-
-func TestClientStalledDuration(t *testing.T) {
-	for _, test := range []struct {
-		name        string
-		pb          int64
-		mp          int64
-		expectedTTL time.Duration
-	}{
-		{"pb above mp", 110, 100, stallClientMaxDuration},
-		{"pb equal mp", 100, 100, stallClientMaxDuration},
-		{"pb below mp/2", 49, 100, stallClientMinDuration},
-		{"pb equal mp/2", 50, 100, stallClientMinDuration},
-		{"pb at 55% of mp", 55, 100, stallClientMinDuration + 1*stallClientMinDuration},
-		{"pb at 60% of mp", 60, 100, stallClientMinDuration + 2*stallClientMinDuration},
-		{"pb at 70% of mp", 70, 100, stallClientMinDuration + 4*stallClientMinDuration},
-		{"pb at 80% of mp", 80, 100, stallClientMinDuration + 6*stallClientMinDuration},
-		{"pb at 90% of mp", 90, 100, stallClientMinDuration + 8*stallClientMinDuration},
-		{"pb at 99% of mp", 99, 100, stallClientMinDuration + 9*stallClientMinDuration},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if ttl := stallDuration(test.pb, test.mp); ttl != test.expectedTTL {
-				t.Fatalf("For pb=%v mp=%v, expected TTL to be %v, got %v", test.pb, test.mp, test.expectedTTL, ttl)
-			}
-		})
 	}
 }
 
@@ -2214,7 +2346,7 @@ type testConnWritePartial struct {
 func (c *testConnWritePartial) Write(p []byte) (int, error) {
 	n := len(p)
 	if c.partial {
-		n = 15
+		n = n/2 + 1
 	}
 	return c.buf.Write(p[:n])
 }
@@ -2246,7 +2378,6 @@ func TestFlushOutboundNoSliceReuseIfPartial(t *testing.T) {
 		expected.Write(buf)
 		c.mu.Lock()
 		c.queueOutbound(buf)
-		c.out.sz = 10
 		c.flushOutbound()
 		fakeConn.partial = false
 		c.mu.Unlock()
@@ -2271,7 +2402,7 @@ type captureNoticeLogger struct {
 	notices []string
 }
 
-func (l *captureNoticeLogger) Noticef(format string, v ...interface{}) {
+func (l *captureNoticeLogger) Noticef(format string, v ...any) {
 	l.Lock()
 	l.notices = append(l.notices, fmt.Sprintf(format, v...))
 	l.Unlock()
@@ -2502,10 +2633,10 @@ func TestClientLimits(t *testing.T) {
 			}
 			c.applyAccountLimits()
 			if c.mpay != test.expect {
-				t.Fatalf("payload %d not as ecpected %d", c.mpay, test.expect)
+				t.Fatalf("payload %d not as expected %d", c.mpay, test.expect)
 			}
 			if c.msubs != test.expect {
-				t.Fatalf("subscriber %d not as ecpected %d", c.msubs, test.expect)
+				t.Fatalf("subscriber %d not as expected %d", c.msubs, test.expect)
 			}
 		})
 	}
@@ -2582,4 +2713,1145 @@ func TestClientDenySysGroupSub(t *testing.T) {
 	err = nc.LastError()
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "Permissions Violation")
+}
+
+func TestClientAuthRequiredNoAuthUser(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: { users: [ { user: user, password: pass } ] }
+		}
+		no_auth_user: user
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	if nc.AuthRequired() {
+		t.Fatalf("Expected AuthRequired to be false due to 'no_auth_user'")
+	}
+}
+
+func TestClientUserInfoReq(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		PERMS = {
+			publish = { allow: "$SYS.REQ.>", deny: "$SYS.REQ.ACCOUNT.>" }
+			subscribe = "_INBOX.>"
+			allow_responses: true
+		}
+		accounts: {
+			A: { users: [ { user: dlc, password: pass, permissions: $PERMS } ] }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		no_auth_user: dlc
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	resp, err := nc.Request("$SYS.REQ.USER.INFO", nil, time.Second)
+	require_NoError(t, err)
+
+	response := ServerAPIResponse{Data: &UserInfo{}}
+	err = json.Unmarshal(resp.Data, &response)
+	require_NoError(t, err)
+
+	userInfo := response.Data.(*UserInfo)
+
+	dlc := &UserInfo{
+		UserID:  "dlc",
+		Account: "A",
+		Permissions: &Permissions{
+			Publish: &SubjectPermission{
+				Allow: []string{"$SYS.REQ.>"},
+				Deny:  []string{"$SYS.REQ.ACCOUNT.>"},
+			},
+			Subscribe: &SubjectPermission{
+				Allow: []string{"_INBOX.>"},
+			},
+			Response: &ResponsePermission{
+				MaxMsgs: DEFAULT_ALLOW_RESPONSE_MAX_MSGS,
+				Expires: DEFAULT_ALLOW_RESPONSE_EXPIRATION,
+			},
+		},
+	}
+	if !reflect.DeepEqual(dlc, userInfo) {
+		t.Fatalf("User info for %q did not match", "dlc")
+	}
+
+	// Make sure system users work ok too.
+	nc, err = nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	resp, err = nc.Request("$SYS.REQ.USER.INFO", nil, time.Second)
+	require_NoError(t, err)
+
+	response = ServerAPIResponse{Data: &UserInfo{}}
+	err = json.Unmarshal(resp.Data, &response)
+	require_NoError(t, err)
+
+	userInfo = response.Data.(*UserInfo)
+
+	admin := &UserInfo{
+		UserID:  "admin",
+		Account: "$SYS",
+	}
+	if !reflect.DeepEqual(admin, userInfo) {
+		t.Fatalf("User info for %q did not match", "admin")
+	}
+}
+
+func TestTLSClientHandshakeFirst(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: 	"../test/configs/certs/server-cert.pem"
+			key_file:  	"../test/configs/certs/server-key.pem"
+			timeout: 	1
+			first: 		%s
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "true")))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	connect := func(tlsfirst, expectedOk bool) {
+		opts := []nats.Option{nats.RootCAs("../test/configs/certs/ca.pem")}
+		if tlsfirst {
+			opts = append(opts, nats.TLSHandshakeFirst())
+		}
+		nc, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", o.Port), opts...)
+		if expectedOk {
+			defer nc.Close()
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if tlsfirst {
+				cz, err := s.Connz(nil)
+				if err != nil {
+					t.Fatalf("Error getting connz: %v", err)
+				}
+				if !cz.Conns[0].TLSFirst {
+					t.Fatal("Expected TLSFirst boolean to be set, it was not")
+				}
+			}
+		} else if !expectedOk && err == nil {
+			nc.Close()
+			t.Fatal("Expected error, got none")
+		}
+	}
+
+	// Server is TLS first, but client is not, so should fail.
+	connect(false, false)
+
+	// Now client is TLS first too, so should work.
+	connect(true, true)
+
+	// Config reload the server and disable tls first
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "false"))
+
+	// Now if client wants TLS first, connection should fail.
+	connect(true, false)
+
+	// But if it does not, should be ok.
+	connect(false, true)
+
+	// Config reload the server again and enable tls first
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "true"))
+
+	// If both client and server are TLS first, this should work.
+	connect(true, true)
+}
+
+func TestTLSClientHandshakeFirstFallbackDelayConfigValues(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: 	"../test/configs/certs/server-cert.pem"
+			key_file:  	"../test/configs/certs/server-key.pem"
+			timeout: 	1
+			first: 		%s
+		}
+	`
+	for _, test := range []struct {
+		name  string
+		val   string
+		first bool
+		delay time.Duration
+	}{
+		{"first as boolean true", "true", true, 0},
+		{"first as boolean false", "false", false, 0},
+		{"first as string true", "\"true\"", true, 0},
+		{"first as string false", "\"false\"", false, 0},
+		{"first as string on", "on", true, 0},
+		{"first as string off", "off", false, 0},
+		{"first as string auto", "auto", true, DEFAULT_TLS_HANDSHAKE_FIRST_FALLBACK_DELAY},
+		{"first as string auto_fallback", "auto_fallback", true, DEFAULT_TLS_HANDSHAKE_FIRST_FALLBACK_DELAY},
+		{"first as fallback duration", "300ms", true, 300 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, test.val)))
+			s, o := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			if test.first {
+				if !o.TLSHandshakeFirst {
+					t.Fatal("Expected tls first to be true, was not")
+				}
+				if test.delay != o.TLSHandshakeFirstFallback {
+					t.Fatalf("Expected fallback delay to be %v, got %v", test.delay, o.TLSHandshakeFirstFallback)
+				}
+			} else {
+				if o.TLSHandshakeFirst {
+					t.Fatal("Expected tls first to be false, was not")
+				}
+				if o.TLSHandshakeFirstFallback != 0 {
+					t.Fatalf("Expected fallback delay to be 0, got %v", o.TLSHandshakeFirstFallback)
+				}
+			}
+		})
+	}
+}
+
+type pauseAfterDial struct {
+	delay time.Duration
+}
+
+func (d *pauseAfterDial) Dial(network, address string) (net.Conn, error) {
+	c, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	time.Sleep(d.delay)
+	return c, nil
+}
+
+func TestTLSClientHandshakeFirstFallbackDelay(t *testing.T) {
+	// Using certificates with RSA 4K to make sure that the fallback does
+	// not prevent a client with TLS first to successfully connect.
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file:  "./configs/certs/tls/benchmark-server-cert-rsa-4096.pem"
+			key_file:   "./configs/certs/tls/benchmark-server-key-rsa-4096.pem"
+			timeout: 	1
+			first: 		%s
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "auto")))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("tls://localhost:%d", o.Port)
+	d := &pauseAfterDial{delay: DEFAULT_TLS_HANDSHAKE_FIRST_FALLBACK_DELAY + 100*time.Millisecond}
+
+	// Connect a client without "TLS first" and it should be accepted.
+	nc, err := nats.Connect(url,
+		nats.SetCustomDialer(d),
+		nats.Secure(&tls.Config{
+			ServerName: "reuben.nats.io",
+			MinVersion: tls.VersionTLS12,
+		}),
+		nats.RootCAs("./configs/certs/tls/benchmark-ca-cert.pem"))
+	require_NoError(t, err)
+	defer nc.Close()
+	// Check that the TLS first in monitoring is set to false
+	cs, err := s.Connz(nil)
+	require_NoError(t, err)
+	if cs.Conns[0].TLSFirst {
+		t.Fatal("Expected monitoring ConnInfo.TLSFirst to be false, it was not")
+	}
+	nc.Close()
+
+	// Wait for the client to be removed
+	checkClientsCount(t, s, 0)
+
+	// Increase the fallback delay with config reload.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "\"1s\""))
+
+	// This time, start the client with "TLS first".
+	// We will also make sure that we did not wait for the fallback delay
+	// in order to connect.
+	start := time.Now()
+	nc, err = nats.Connect(url,
+		nats.SetCustomDialer(d),
+		nats.Secure(&tls.Config{
+			ServerName: "reuben.nats.io",
+			MinVersion: tls.VersionTLS12,
+		}),
+		nats.RootCAs("./configs/certs/tls/benchmark-ca-cert.pem"),
+		nats.TLSHandshakeFirst())
+	require_NoError(t, err)
+	require_True(t, time.Since(start) < 500*time.Millisecond)
+	defer nc.Close()
+
+	// Check that the TLS first in monitoring is set to true.
+	cs, err = s.Connz(nil)
+	require_NoError(t, err)
+	if !cs.Conns[0].TLSFirst {
+		t.Fatal("Expected monitoring ConnInfo.TLSFirst to be true, it was not")
+	}
+	nc.Close()
+}
+
+func TestTLSClientHandshakeFirstFallbackDelayAndAllowNonTLS(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: 	"../test/configs/certs/server-cert.pem"
+			key_file:  	"../test/configs/certs/server-key.pem"
+			timeout: 	1
+			first: 		%s
+		}
+		allow_non_tls: true
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "true")))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// We first start with a server that has handshake first set to true
+	// and allow_non_tls. In that case, only "TLS first" clients should be
+	// accepted.
+	url := fmt.Sprintf("tls://localhost:%d", o.Port)
+	nc, err := nats.Connect(url,
+		nats.RootCAs("../test/configs/certs/ca.pem"),
+		nats.TLSHandshakeFirst())
+	require_NoError(t, err)
+	defer nc.Close()
+	// Check that the TLS first in monitoring is set to true
+	cs, err := s.Connz(nil)
+	require_NoError(t, err)
+	if !cs.Conns[0].TLSFirst {
+		t.Fatal("Expected monitoring ConnInfo.TLSFirst to be true, it was not")
+	}
+	nc.Close()
+
+	// Client not using "TLS First" should fail.
+	nc, err = nats.Connect(url, nats.RootCAs("../test/configs/certs/ca.pem"))
+	if err == nil {
+		nc.Close()
+		t.Fatal("Expected connection to fail, it did not")
+	}
+
+	// And non TLS clients should also fail to connect.
+	nc, err = nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", o.Port))
+	if err == nil {
+		nc.Close()
+		t.Fatal("Expected connection to fail, it did not")
+	}
+
+	// Now we will replace TLS first in server with a fallback delay.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "\"25ms\""))
+
+	// Clients with "TLS first" should still be able to connect
+	nc, err = nats.Connect(url,
+		nats.RootCAs("../test/configs/certs/ca.pem"),
+		nats.TLSHandshakeFirst())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	checkConnInfo := func(isTLS, isTLSFirst bool) {
+		t.Helper()
+		cs, err = s.Connz(nil)
+		require_NoError(t, err)
+		conn := cs.Conns[0]
+		if !isTLS {
+			if conn.TLSVersion != _EMPTY_ {
+				t.Fatalf("Being a non TLS client, there should not be TLSVersion set, got %v", conn.TLSVersion)
+			}
+			if conn.TLSFirst {
+				t.Fatal("Being a non TLS client, TLSFirst should not be set, but it was")
+			}
+			return
+		}
+		if isTLSFirst && !conn.TLSFirst {
+			t.Fatal("Expected monitoring ConnInfo.TLSFirst to be true, it was not")
+		} else if !isTLSFirst && conn.TLSFirst {
+			t.Fatal("Expected monitoring ConnInfo.TLSFirst to be false, it was not")
+		}
+		nc.Close()
+
+		checkClientsCount(t, s, 0)
+	}
+	checkConnInfo(true, true)
+
+	// Clients with TLS but not "TLS first" should also be able to connect.
+	nc, err = nats.Connect(url, nats.RootCAs("../test/configs/certs/ca.pem"))
+	require_NoError(t, err)
+	defer nc.Close()
+	checkConnInfo(true, false)
+
+	// And non TLS clients should also be able to connect.
+	nc, err = nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", o.Port))
+	require_NoError(t, err)
+	defer nc.Close()
+	checkConnInfo(false, false)
+}
+
+func TestTLSClientHandshakeFirstAndInProcessConnection(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: 	"../test/configs/certs/server-cert.pem"
+			key_file:  	"../test/configs/certs/server-key.pem"
+			timeout: 	1
+			first: 		true
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Check that we can create an in process connection that does not use TLS
+	nc, err := nats.Connect(_EMPTY_, nats.InProcessServer(s))
+	require_NoError(t, err)
+	defer nc.Close()
+	if nc.TLSRequired() {
+		t.Fatalf("Shouldn't have required TLS for in-process connection")
+	}
+	if _, err = nc.TLSConnectionState(); err == nil {
+		t.Fatal("Should have got an error retrieving TLS connection state")
+	}
+	nc.Close()
+
+	// If the client wants TLS, it should get a TLS connection.
+	nc, err = nats.Connect(_EMPTY_,
+		nats.InProcessServer(s),
+		nats.RootCAs("../test/configs/certs/ca.pem"))
+	require_NoError(t, err)
+	defer nc.Close()
+	if _, err = nc.TLSConnectionState(); err != nil {
+		t.Fatal("Should have not got an error retrieving TLS connection state")
+	}
+	// However, the server would not have sent that TLS was required,
+	// but instead it is available.
+	if nc.TLSRequired() {
+		t.Fatalf("Shouldn't have required TLS for in-process connection")
+	}
+	nc.Close()
+
+	// The in-process connection with TLS and "TLS first" should also be working.
+	nc, err = nats.Connect(_EMPTY_,
+		nats.InProcessServer(s),
+		nats.RootCAs("../test/configs/certs/ca.pem"),
+		nats.TLSHandshakeFirst())
+	require_NoError(t, err)
+	defer nc.Close()
+	if !nc.TLSRequired() {
+		t.Fatalf("The server should have sent that TLS is required")
+	}
+	if _, err = nc.TLSConnectionState(); err != nil {
+		t.Fatal("Should have not got an error retrieving TLS connection state")
+	}
+}
+
+func TestRemoveHeaderIfPrefixPresent(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	hdr = genHeader(hdr, "a", "1")
+	hdr = genHeader(hdr, JSExpectedStream, "my-stream")
+	hdr = genHeader(hdr, JSExpectedLastSeq, "22")
+	hdr = genHeader(hdr, "b", "2")
+	hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+	hdr = genHeader(hdr, JSExpectedLastMsgId, "1")
+	hdr = genHeader(hdr, "c", "3")
+
+	hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
+
+	if !bytes.Equal(hdr, []byte("NATS/1.0\r\na: 1\r\nb: 2\r\nc: 3\r\n\r\n")) {
+		t.Fatalf("Expected headers to be stripped, got %q", hdr)
+	}
+}
+
+func TestSliceHeader(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	hdr = genHeader(hdr, "a", "1")
+	hdr = genHeader(hdr, JSExpectedStream, "my-stream")
+	hdr = genHeader(hdr, JSExpectedLastSeq, "22")
+	hdr = genHeader(hdr, "b", "2")
+	hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+	hdr = genHeader(hdr, JSExpectedLastMsgId, "1")
+	hdr = genHeader(hdr, "c", "3")
+
+	sliced := sliceHeader(JSExpectedLastSubjSeq, hdr)
+	copied := getHeader(JSExpectedLastSubjSeq, hdr)
+
+	require_NotNil(t, sliced)
+	require_Equal(t, cap(sliced), 2)
+
+	require_NotNil(t, copied)
+	require_Equal(t, cap(copied), len(copied))
+
+	require_True(t, bytes.Equal(sliced, copied))
+}
+
+func TestSliceHeaderOrderingPrefix(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	// These headers share the same prefix, the longer subject
+	// must not invalidate the existence of the shorter one.
+	hdr = genHeader(hdr, JSExpectedLastSubjSeqSubj, "foo")
+	hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+
+	sliced := sliceHeader(JSExpectedLastSubjSeq, hdr)
+	copied := getHeader(JSExpectedLastSubjSeq, hdr)
+
+	require_NotNil(t, sliced)
+	require_Equal(t, cap(sliced), 2)
+
+	require_NotNil(t, copied)
+	require_Equal(t, cap(copied), len(copied))
+
+	require_True(t, bytes.Equal(sliced, copied))
+}
+
+func TestSliceHeaderOrderingSuffix(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	// These headers share the same suffix, the longer subject
+	// must not invalidate the existence of the shorter one.
+	hdr = genHeader(hdr, "Previous-Nats-Msg-Id", "user")
+	hdr = genHeader(hdr, "Nats-Msg-Id", "control")
+
+	sliced := sliceHeader("Nats-Msg-Id", hdr)
+	copied := getHeader("Nats-Msg-Id", hdr)
+
+	require_NotNil(t, sliced)
+	require_NotNil(t, copied)
+	require_True(t, bytes.Equal(sliced, copied))
+	require_Equal(t, string(copied), "control")
+}
+
+func TestRemoveHeaderIfPresentOrderingPrefix(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	// These headers share the same prefix, the longer subject
+	// must not invalidate the existence of the shorter one.
+	hdr = genHeader(hdr, JSExpectedLastSubjSeqSubj, "foo")
+	hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+
+	hdr = removeHeaderIfPresent(hdr, JSExpectedLastSubjSeq)
+	ehdr := genHeader(nil, JSExpectedLastSubjSeqSubj, "foo")
+	require_True(t, bytes.Equal(hdr, ehdr))
+}
+
+func TestRemoveHeaderIfPresentOrderingSuffix(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	// These headers share the same suffix, the longer subject
+	// must not invalidate the existence of the shorter one.
+	hdr = genHeader(hdr, "Previous-Nats-Msg-Id", "user")
+	hdr = genHeader(hdr, "Nats-Msg-Id", "control")
+
+	hdr = removeHeaderIfPresent(hdr, "Nats-Msg-Id")
+	ehdr := genHeader(nil, "Previous-Nats-Msg-Id", "user")
+	require_True(t, bytes.Equal(hdr, ehdr))
+}
+
+func TestMsgPartsCapsHdrSlice(t *testing.T) {
+	c := &client{}
+	hdrContent := hdrLine + "Key1: Val1\r\nKey2: Val2\r\n\r\n"
+	msgBody := "hello\r\n"
+	buf := slices.Clone([]byte(hdrContent + msgBody))
+	c.pa.hdr = len(hdrContent)
+
+	hdr, msg := c.msgParts(buf)
+	// Make sure "hdr" and "msg" are as expected.
+	require_Equal(t, string(hdr), hdrContent)
+	require_Equal(t, string(msg), msgBody)
+	// Previously, cap(hdr) would have been the same than the one of "buf",
+	// but now this is not the case.
+	require_True(t, cap(hdr) < cap(buf))
+	// Just to make sure, try to add something (smaller than "hello\r\n")
+	// to "hdr" and make sure the "msg" content is not modified.
+	hdr = append(hdr, "test"...)
+	require_Equal(t, string(hdr), hdrContent+"test")
+	require_Equal(t, string(msg), "hello\r\n")
+}
+
+func TestSetHeaderDoesNotOverwriteUnderlyingBuffer(t *testing.T) {
+	initialHdrContent := "NATS/1.0\r\nKey1: Val1\r\nKey2: Val2\r\n\r\n"
+	msgBody := "this is the message body\r\n"
+	for _, test := range []struct {
+		name        string
+		key         string
+		val         string
+		expectedHdr string
+		newBuf      bool
+	}{
+		{"existing key new value larger", "Key1", "Val1Updated", "NATS/1.0\r\nKey1: Val1Updated\r\nKey2: Val2\r\n\r\n", true},
+		{"existing key new value smaller", "Key1", "v1", "NATS/1.0\r\nKey1: v1\r\nKey2: Val2\r\n\r\n", false},
+		{"new key", "Key3", "Val3", "NATS/1.0\r\nKey1: Val1\r\nKey2: Val2\r\nKey3: Val3\r\n\r\n", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buf := make([]byte, 0, len(initialHdrContent)+len(msgBody))
+			buf = append(buf, initialHdrContent...)
+			msgStart := len(buf)
+			buf = append(buf, msgBody...)
+
+			// Simulate that we create slices out of the underlying buffer,
+			// separating the header and body parts.
+			hdr, msg := buf[:msgStart], buf[msgStart:]
+			hdr = setHeader(test.key, test.val, hdr)
+			require_Equal(t, string(hdr), test.expectedHdr)
+			require_Equal(t, string(msg), msgBody)
+			if test.newBuf {
+				// The "hdr" part of the underlying buffer should not have
+				// been changed.
+				require_Equal(t, string(buf[:len(initialHdrContent)]), initialHdrContent)
+			} else {
+				// The "hdr" part of the underlying buffer has been changed.
+				require_Equal(t, string(buf[:len(test.expectedHdr)]), test.expectedHdr)
+			}
+		})
+	}
+}
+
+func TestSetHeaderOrderingPrefix(t *testing.T) {
+	for _, space := range []bool{true, false} {
+		title := "Normal"
+		if !space {
+			title = "Trimmed"
+		}
+		t.Run(title, func(t *testing.T) {
+			hdr := []byte("NATS/1.0\r\n\r\n")
+
+			// These headers share the same prefix, the longer subject
+			// must not invalidate the existence of the shorter one.
+			hdr = genHeader(hdr, JSExpectedLastSubjSeqSubj, "foo")
+			hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+			if !space {
+				hdr = bytes.ReplaceAll(hdr, []byte(" "), nil)
+			}
+
+			hdr = setHeader(JSExpectedLastSubjSeq, "12", hdr)
+			ehdr := genHeader(nil, JSExpectedLastSubjSeqSubj, "foo")
+			ehdr = genHeader(ehdr, JSExpectedLastSubjSeq, "12")
+			if !space {
+				ehdr = bytes.ReplaceAll(ehdr, []byte(" "), nil)
+			}
+			require_True(t, bytes.Equal(hdr, ehdr))
+		})
+	}
+}
+
+func TestSetHeaderOrderingSuffix(t *testing.T) {
+	for _, space := range []bool{true, false} {
+		title := "Normal"
+		if !space {
+			title = "Trimmed"
+		}
+		t.Run(title, func(t *testing.T) {
+			hdr := []byte("NATS/1.0\r\n\r\n")
+
+			// These headers share the same suffix, the longer subject
+			// must not invalidate the existence of the shorter one.
+			hdr = genHeader(hdr, "Previous-Nats-Msg-Id", "user")
+			hdr = genHeader(hdr, "Nats-Msg-Id", "control")
+			if !space {
+				hdr = bytes.ReplaceAll(hdr, []byte(" "), nil)
+			}
+
+			hdr = setHeader("Nats-Msg-Id", "other", hdr)
+			ehdr := genHeader(nil, "Previous-Nats-Msg-Id", "user")
+			ehdr = genHeader(ehdr, "Nats-Msg-Id", "other")
+			if !space {
+				ehdr = bytes.ReplaceAll(ehdr, []byte(" "), nil)
+			}
+			require_True(t, bytes.Equal(hdr, ehdr))
+		})
+	}
+}
+
+func TestInProcessAllowedConnectionType(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			A { users: [{user: "test", password: "pwd", allowed_connection_types: ["%s"]}] }
+		}
+		write_deadline: "500ms"
+	`
+	for _, test := range []struct {
+		name          string
+		ct            string
+		inProcessOnly bool
+	}{
+		{"conf inprocess", jwt.ConnectionTypeInProcess, true},
+		{"conf standard", jwt.ConnectionTypeStandard, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, test.ct)))
+			s, _ := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			// Create standard connection
+			nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("test", "pwd"))
+			if test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected standard connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only in-process are allowed)
+			nc.Close()
+
+			// Create inProcess connection
+			nc, err = nats.Connect(_EMPTY_, nats.UserInfo("test", "pwd"), nats.InProcessServer(s))
+			if !test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected in-process connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only standard are allowed)
+			nc.Close()
+		})
+	}
+	for _, test := range []struct {
+		name          string
+		ct            string
+		inProcessOnly bool
+	}{
+		{"jwt inprocess", jwt.ConnectionTypeInProcess, true},
+		{"jwt standard", jwt.ConnectionTypeStandard, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			skp, _ := nkeys.FromSeed(oSeed)
+			spub, _ := skp.PublicKey()
+
+			o := defaultServerOptions
+			o.TrustedKeys = []string{spub}
+			o.WriteDeadline = 500 * time.Millisecond
+			s := RunServer(&o)
+			defer s.Shutdown()
+
+			buildMemAccResolver(s)
+
+			kp, _ := nkeys.CreateAccount()
+			aPub, _ := kp.PublicKey()
+			claim := jwt.NewAccountClaims(aPub)
+			aJwt, err := claim.Encode(oKp)
+			require_NoError(t, err)
+
+			addAccountToMemResolver(s, aPub, aJwt)
+
+			creds := createUserWithLimit(t, kp, time.Time{},
+				func(j *jwt.UserPermissionLimits) {
+					j.AllowedConnectionTypes.Add(test.ct)
+				})
+			// Create standard connection
+			nc, err := nats.Connect(s.ClientURL(), nats.UserCredentials(creds))
+			if test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected standard connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only in-process are allowed)
+			nc.Close()
+
+			// Create inProcess connection
+			nc, err = nats.Connect(_EMPTY_, nats.UserCredentials(creds), nats.InProcessServer(s))
+			if !test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected in-process connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only standard are allowed)
+			nc.Close()
+		})
+	}
+}
+
+func TestClientFlushOutboundNoSlowConsumer(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxPending = 1024 * 1024 * 140 // 140MB
+	opts.MaxPayload = 1024 * 1024 * 16  // 16MB
+	opts.WriteDeadline = time.Second * 30
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+	defer nc.Close()
+
+	proxy := newNetProxy(0, 1024*1024*8, 1024*1024*8, s.ClientURL()) // 8MB/s
+	defer proxy.stop()
+
+	wait := make(chan error)
+
+	nca, err := nats.Connect(proxy.clientURL(), nats.NoCallbacksAfterClientClose())
+	require_NoError(t, err)
+	defer nca.Close()
+	nca.SetDisconnectErrHandler(func(c *nats.Conn, err error) {
+		wait <- err
+		close(wait)
+	})
+
+	ncb, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer ncb.Close()
+
+	_, err = nca.Subscribe("test", func(msg *nats.Msg) {
+		wait <- nil
+	})
+	require_NoError(t, err)
+
+	// Publish 128MB of data onto the test subject. This will
+	// mean that the outbound queue for nca has more than 64MB,
+	// which is the max we will send into a single writev call.
+	payload := make([]byte, 1024*1024*16) // 16MB
+	for i := 0; i < 8; i++ {
+		require_NoError(t, ncb.Publish("test", payload))
+	}
+
+	// Get the client ID for nca.
+	cid, err := nca.GetClientID()
+	require_NoError(t, err)
+
+	// Check that the client queue has more than 64MB queued
+	// up in it.
+	s.mu.RLock()
+	ca := s.clients[cid]
+	s.mu.RUnlock()
+	ca.mu.Lock()
+	pba := ca.out.pb
+	ca.mu.Unlock()
+	require_True(t, pba > 1024*1024*64)
+
+	// Wait for our messages to be delivered. This will take
+	// a few seconds as the client is limited to 8MB/s, so it
+	// can't deliver messages to us as quickly as the other
+	// client can publish them.
+	var msgs int
+	for err := range wait {
+		require_NoError(t, err)
+		msgs++
+		if msgs == 8 {
+			break
+		}
+	}
+	require_Equal(t, msgs, 8)
+}
+
+func TestClientRejectsNRGSubjects(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: { users: [ { user: nat, password: pass } ] }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		no_auth_user: nat
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	t.Run("System", func(t *testing.T) {
+		ech := make(chan error, 1)
+		nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) {
+				ech <- e
+			}),
+		)
+		require_NoError(t, err)
+		defer nc.Close()
+
+		// System account clients are allowed to publish to these subjects.
+		require_NoError(t, nc.Publish("$NRG.foo", nil))
+		require_NoChanRead(t, ech, time.Second)
+	})
+
+	t.Run("Normal", func(t *testing.T) {
+		ech := make(chan error, 1)
+		nc, err := nats.Connect(s.ClientURL(),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) {
+				ech <- e
+			}),
+		)
+		require_NoError(t, err)
+		defer nc.Close()
+
+		// Non-system clients should receive a pub permission error.
+		require_NoError(t, nc.Publish("$NRG.foo", nil))
+		err = require_ChanRead(t, ech, time.Second)
+		require_Error(t, err)
+		require_True(t, strings.HasPrefix(err.Error(), "nats: permissions violation"))
+	})
+}
+
+func TestConnectionStringWithLogConnectionInfo(t *testing.T) {
+	opts := DefaultOptions()
+	s, c, _, _ := rawSetup(*opts)
+	defer c.close()
+	defer s.Shutdown()
+
+	c.kind = CLIENT
+	connectArg := []byte("{\"verbose\":false,\"pedantic\":false,\"version\":\"1.0.0\",\"lang\":\"go\",\"name\":\"test-client\"}")
+
+	err := c.processConnect(connectArg)
+	if err != nil {
+		t.Fatalf("Received error on first processConnect: %v", err)
+	}
+
+	// Get the connection string after first processConnect.
+	firstConnStr := c.ncs.Load()
+	if firstConnStr == nil {
+		return
+	}
+	firstStr := firstConnStr.(string)
+	firstLen := len(firstStr)
+	require_Equal(t, firstStr, `pipe - cid:1 - "v1.0.0:go:test-client"`)
+
+	// Process connect multiple times.
+	for i := 0; i < 3; i++ {
+		err = c.processConnect(connectArg)
+		if err != nil {
+			t.Fatalf("Received error on processConnect attempt %d: %v", i+2, err)
+		}
+	}
+
+	// Get the connection string after multiple calls.
+	finalConnStr := c.ncs.Load()
+	require_NotNil(t, finalConnStr)
+
+	finalStr := finalConnStr.(string)
+	require_Equal(t, firstStr, finalStr)
+
+	// Now send a different connect over the same connection.
+	connectArg2 := []byte("{\"verbose\":false,\"pedantic\":false,\"version\":\"1.0.0\",\"lang\":\"go\",\"name\":\"test-client:new\"}")
+
+	err = c.processConnect(connectArg2)
+	if err != nil {
+		t.Fatalf("Received error on processConnect: %v", err)
+	}
+	finalConnStr = c.ncs.Load()
+	require_NotNil(t, finalConnStr)
+
+	// Check that it remains the same size after a different connect.
+	finalStr = finalConnStr.(string)
+	finalLen := len(finalStr)
+	if finalLen > firstLen {
+		t.Fatalf("Connection string grew from %d to %d characters", firstLen, finalLen)
+	}
+}
+
+func TestLogConnectionAuthInfo(t *testing.T) {
+	t.Run("username_password", func(t *testing.T) {
+		opts := DefaultOptions()
+		opts.Username = "testuser"
+		opts.Password = "testpass"
+		s, c, _, _ := rawSetup(*opts)
+		defer c.close()
+		defer s.Shutdown()
+
+		c.kind = CLIENT
+		connectArg := []byte(`{"verbose":false,"pedantic":false,"user":"testuser","pass":"testpass"}`)
+
+		err := c.processConnect(connectArg)
+		require_NoError(t, err)
+
+		connStr := c.ncs.Load()
+		require_NotNil(t, connStr)
+		str := connStr.(string)
+		require_Contains(t, str, `"$G/user:testuser"`)
+	})
+	t.Run("token", func(t *testing.T) {
+		opts := DefaultOptions()
+		opts.Authorization = "secret-token"
+		s, c, _, _ := rawSetup(*opts)
+		defer c.close()
+		defer s.Shutdown()
+
+		c.kind = CLIENT
+		connectArg := []byte(`{"verbose":false,"pedantic":false,"auth_token":"secret-token"}`)
+
+		err := c.processConnect(connectArg)
+		require_NoError(t, err)
+
+		connStr := c.ncs.Load()
+		require_NotNil(t, connStr)
+		str := connStr.(string)
+		require_Contains(t, str, `"$G/token"`)
+	})
+	t.Run("nkey", func(t *testing.T) {
+		kp, _ := nkeys.CreateUser()
+		pub, _ := kp.PublicKey()
+		nkey := string(pub)
+
+		opts := DefaultOptions()
+		opts.Nkeys = []*NkeyUser{{Nkey: nkey}}
+		s, c, _, _ := rawSetup(*opts)
+		defer c.close()
+		defer s.Shutdown()
+
+		c.kind = CLIENT
+		nonce := make([]byte, 32)
+		c.nonce = nonce
+		sig, _ := kp.Sign(nonce)
+		sigEncoded := base64.RawURLEncoding.EncodeToString(sig)
+
+		connectArg := fmt.Sprintf(`{"verbose":false,"pedantic":false,"nkey":"%s","sig":"%s"}`, nkey, sigEncoded)
+
+		err := c.processConnect([]byte(connectArg))
+		require_NoError(t, err)
+
+		connStr := c.ncs.Load()
+		require_NotNil(t, connStr)
+		str := connStr.(string)
+		require_Contains(t, str, fmt.Sprintf(`"$G/nkey:%s"`, nkey))
+	})
+	t.Run("combined_info_and_auth", func(t *testing.T) {
+		opts := DefaultOptions()
+		opts.Username = "testuser"
+		opts.Password = "testpass"
+		s, c, _, _ := rawSetup(*opts)
+		defer c.close()
+		defer s.Shutdown()
+
+		c.kind = CLIENT
+		connectArg := []byte(`{"verbose":false,"pedantic":false,"user":"testuser","pass":"testpass","version":"1.0.0","lang":"go","name":"test-client"}`)
+
+		err := c.processConnect(connectArg)
+		require_NoError(t, err)
+
+		connStr := c.ncs.Load()
+		require_NotNil(t, connStr)
+		str := connStr.(string)
+		require_Contains(t, str, `"v1.0.0:go:test-client"`)
+		require_Contains(t, str, `"$G/user:testuser"`)
+	})
+	t.Run("no_auth", func(t *testing.T) {
+		opts := DefaultOptions()
+		s, c, _, _ := rawSetup(*opts)
+		defer c.close()
+		defer s.Shutdown()
+
+		c.kind = CLIENT
+		connectArg := []byte(`{"verbose":false,"pedantic":false}`)
+
+		err := c.processConnect(connectArg)
+		require_NoError(t, err)
+
+		connStr := c.ncs.Load()
+		if connStr != nil {
+			str := connStr.(string)
+			if strings.Contains(str, "$G/") {
+				t.Fatalf("Expected no auth info when no authentication provided, got: %s", str)
+			}
+		}
+	})
+}
+
+func TestClientConfigureWriteTimeoutPolicy(t *testing.T) {
+	for name, policy := range map[string]WriteTimeoutPolicy{
+		"Default": WriteTimeoutPolicyDefault,
+		"Retry":   WriteTimeoutPolicyRetry,
+		"Close":   WriteTimeoutPolicyClose,
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.WriteTimeout = policy
+			s := RunServer(opts)
+			defer s.Shutdown()
+
+			nc := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+			defer nc.Close()
+
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+
+			for _, r := range s.clients {
+				if policy == WriteTimeoutPolicyDefault {
+					require_Equal(t, r.out.wtp, WriteTimeoutPolicyClose)
+				} else {
+					require_Equal(t, r.out.wtp, policy)
+				}
+			}
+		})
+	}
+}
+
+// TestClientFlushOutboundWriteTimeoutPolicy relies on specifically having
+// written at least one byte in order to not trip the "written == 0" close
+// condition, so just setting an unrealistically low write deadline won't
+// work. Instead what we'll do is write the first byte very quickly and then
+// slow down, so that we can trip a more honest slow consumer condition.
+type writeTimeoutPolicyWriter struct {
+	net.Conn
+	deadline time.Time
+	written  int
+}
+
+func (w *writeTimeoutPolicyWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return w.Conn.SetWriteDeadline(deadline)
+}
+
+func (w *writeTimeoutPolicyWriter) Write(b []byte) (int, error) {
+	if w.written == 0 {
+		w.written++
+		return w.Conn.Write(b[:1])
+	}
+	time.Sleep(time.Until(w.deadline) + 10*time.Millisecond)
+	return w.Conn.Write(b)
+}
+
+func TestClientFlushOutboundWriteTimeoutPolicy(t *testing.T) {
+	for name, policy := range map[string]WriteTimeoutPolicy{
+		"Retry": WriteTimeoutPolicyRetry,
+		"Close": WriteTimeoutPolicyClose,
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.PingInterval = 250 * time.Millisecond
+			opts.WriteDeadline = 100 * time.Millisecond
+			opts.WriteTimeout = policy
+			s := RunServer(opts)
+			defer s.Shutdown()
+
+			nc1 := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+			defer nc1.Close()
+
+			_, err := nc1.Subscribe("test", func(_ *nats.Msg) {})
+			require_NoError(t, err)
+
+			nc2 := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+			defer nc2.Close()
+
+			cid, err := nc1.GetClientID()
+			require_NoError(t, err)
+
+			client := s.getClient(cid)
+			client.mu.Lock()
+			client.out.wdl = 100 * time.Millisecond
+			client.nc = &writeTimeoutPolicyWriter{Conn: client.nc}
+			client.mu.Unlock()
+
+			require_NoError(t, nc2.Publish("test", make([]byte, 1024*1024)))
+
+			checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				switch {
+				case !client.flags.isSet(connMarkedClosed):
+					return fmt.Errorf("connection not closed yet")
+				case policy == WriteTimeoutPolicyRetry && client.flags.isSet(isSlowConsumer):
+					// Retry policy should have marked the client as a slow consumer and
+					// continued to retry flushes.
+					return nil
+				case policy == WriteTimeoutPolicyClose && !client.flags.isSet(isSlowConsumer):
+					// Close policy shouldn't have marked the client as a slow consumer,
+					// it will just close it instead.
+					return nil
+				default:
+					return fmt.Errorf("client not in correct state yet")
+				}
+			})
+		})
+	}
 }
